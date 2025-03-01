@@ -3,3 +3,4 @@
 credentials.json
 processed_events.json
 token.json
+__pycache__
