@@ -13,6 +13,7 @@ services:
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
       - USER_ID=${USER_ID}
+      - CHECK_INTERVAL=${CHECK_INTERVAL}
       - PYTHONUNBUFFERED=1
       - TOKEN_DIR=/data/tokens
       - DATA_DIR=/data 
