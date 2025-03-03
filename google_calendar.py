@@ -19,14 +19,20 @@ SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 # Словарь для хранения состояний авторизации пользователей
 auth_states = {}
 
+# Директория для хранения токенов
+TOKEN_DIR = os.getenv("TOKEN_DIR", ".")
+
+# Убедимся, что директория существует
+os.makedirs(TOKEN_DIR, exist_ok=True)
+
 async def get_credentials(user_id=None):
     """Получение и обновление учетных данных Google."""
     creds = None
-    token_file = 'token.json'
+    token_file = os.path.join(TOKEN_DIR, 'token.json')
     
     # Если указан user_id, используем персональный файл токена
     if user_id:
-        token_file = f'token_{user_id}.json'
+        token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
     
     # Файл token.json хранит токены доступа и обновления пользователя
     if os.path.exists(token_file):
@@ -86,7 +92,7 @@ async def process_auth_code(user_id, code):
         creds = flow.credentials
         
         # Сохраняем учетные данные
-        token_file = f'token_{user_id}.json'
+        token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
         with open(token_file, 'w') as token:
             token.write(creds.to_json())
         
@@ -114,13 +120,18 @@ async def get_upcoming_events(limit=10, time_min=None, time_max=None, user_id=No
     
     # Устанавливаем временные рамки, если не указаны
     if time_min is None:
-        time_min = datetime.utcnow()
+        # Используем начало текущего дня в UTC
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        time_min = today
     if time_max is None:
-        time_max = time_min + timedelta(days=7)
+        # Используем конец дня через 7 дней
+        time_max = today + timedelta(days=7, hours=23, minutes=59, seconds=59)
     
     # Форматируем время в формат RFC3339
     time_min_str = time_min.isoformat() + 'Z'
     time_max_str = time_max.isoformat() + 'Z'
+    
+    logging.info(f"Запрашиваем события с {time_min_str} по {time_max_str}")
     
     # Вызываем API
     events_result = await loop.run_in_executor(
@@ -137,12 +148,21 @@ async def get_upcoming_events(limit=10, time_min=None, time_max=None, user_id=No
     
     events = events_result.get('items', [])
     
+    # Логируем количество полученных событий
+    logging.info(f"Получено {len(events)} событий из календаря")
+    
+    # Логируем первые несколько событий для отладки
+    for i, event in enumerate(events[:3]):
+        start_time = event['start'].get('dateTime', event['start'].get('date'))
+        summary = event.get('summary', 'Без названия')
+        logging.info(f"Событие {i+1}: {summary} в {start_time}")
+    
     # Возвращаем все события, а не только с Google Meet
-    return events 
+    return events
 
 async def get_credentials_with_local_server(user_id):
     """Получение учетных данных через локальный сервер."""
-    token_file = f'token_{user_id}.json'
+    token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
     
     try:
         # Создаем flow с локальным сервером

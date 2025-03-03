@@ -27,6 +27,14 @@ dp = Dispatcher()
 # ID пользователя, которому отправлять уведомления
 USER_ID = os.getenv("USER_ID")
 
+# Директория для хранения токенов и данных
+TOKEN_DIR = os.getenv("TOKEN_DIR", ".")
+DATA_DIR = os.getenv("DATA_DIR", ".")
+
+# Убедимся, что директории существуют
+os.makedirs(TOKEN_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # Команда /start
 @dp.message(Command("start"))
 async def command_start(message: Message):
@@ -53,7 +61,7 @@ async def check_week_meetings(message: Message):
     user_id = message.from_user.id
     
     # Проверяем, авторизован ли пользователь
-    token_file = f'token_{user_id}.json'
+    token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
     if not os.path.exists(token_file):
         await message.answer(
             "Вы не авторизованы в Google Calendar.\n"
@@ -65,9 +73,20 @@ async def check_week_meetings(message: Message):
     
     try:
         # Получаем события на ближайшие 7 дней
+        # Используем начало текущего дня
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        # Определяем начало недели в зависимости от текущего дня
+        current_weekday = today.weekday()
+        if current_weekday >= 5:  # Суббота (5) или воскресенье (6)
+            # Следующий понедельник
+            week_start = today + timedelta(days=(7 - current_weekday))
+        else:
+            # Текущий понедельник
+            week_start = today - timedelta(days=current_weekday)
+            
         events = await get_upcoming_events(
-            time_min=datetime.now(),
-            time_max=datetime.now() + timedelta(days=7),
+            time_min=week_start,
+            time_max=week_start + timedelta(days=7),
             limit=20,
             user_id=user_id
         )
@@ -75,6 +94,9 @@ async def check_week_meetings(message: Message):
         if not events:
             await message.answer("У вас нет предстоящих встреч на неделю.")
             return
+        
+        # Логируем количество полученных событий
+        logging.info(f"Получено {len(events)} событий для пользователя {user_id}")
         
         # Группируем встречи по дням
         meetings_by_day = {}
@@ -90,24 +112,26 @@ async def check_week_meetings(message: Message):
         
         # Отправляем встречи по дням
         for day, day_events in sorted(meetings_by_day.items()):
-            day_message = f"📆 {hbold(f'Встречи на {day}:')}\n\n"
+            day_message = f"📆 {hbold(f'Встречи на {day}:')}"
+            has_meetings = False
             
             for event in day_events:
                 start_time = event['start'].get('dateTime', event['start'].get('date'))
                 start_dt = safe_parse_datetime(start_time)
                 
-                # Добавляем только встречи с ссылкой на Google Meet
+                # Добавляем все встречи
+                
+                # Если есть ссылка на Google Meet, добавляем ее
                 if 'hangoutLink' in event:
-                    day_message += (
-                        f"🕒 {start_dt.strftime('%H:%M')} - {hbold(event['summary'])}\n"
-                        f"🔗 [Ссылка на встречу]({event['hangoutLink']})\n\n"
-                    )
+                    day_message += f"🕒 {start_dt.strftime('%H:%M')} - {hbold(event['summary'])}\n"
+                    day_message += f"🔗 {event['hangoutLink']}\n"
+                    await message.answer(day_message, parse_mode="HTML")
+                day_message += "\n"
+                has_meetings = True
             
-            # Отправляем сообщение только если есть встречи с ссылками
-            if "🔗" in day_message:
-                await message.answer(day_message, parse_mode="HTML")
-            else:
-                await message.answer(f"📆 {hbold(f'На {day} нет онлайн-встреч')}", parse_mode="HTML")
+            # Отправляем сообщение если есть встречи
+            if not has_meetings:
+                await message.answer(f"📆 {hbold(f'На {day} нет встреч')}", parse_mode="HTML")
     
     except Exception as e:
         logging.error(f"Ошибка при получении встреч на неделю: {e}")
@@ -116,9 +140,21 @@ async def check_week_meetings(message: Message):
 # Команда /reset для сброса кэша обработанных встреч
 @dp.message(Command("reset"))
 async def reset_processed_events(message: Message):
-    if os.path.exists('processed_events.json'):
-        os.remove('processed_events.json')
-        await message.answer("Кэш обработанных встреч сброшен. Теперь вы получите уведомления о всех текущих встречах как о новых.")
+    processed_events_file = os.path.join(DATA_DIR, 'processed_events.json')
+    started_events_file = os.path.join(DATA_DIR, 'started_events.json')
+    
+    files_reset = []
+    
+    if os.path.exists(processed_events_file):
+        os.remove(processed_events_file)
+        files_reset.append("уведомления о предстоящих встречах")
+    
+    if os.path.exists(started_events_file):
+        os.remove(started_events_file)
+        files_reset.append("уведомления о начавшихся встречах")
+    
+    if files_reset:
+        await message.answer(f"Кэш сброшен: {', '.join(files_reset)}. Теперь вы получите уведомления о всех текущих встречах как о новых.")
     else:
         await message.answer("Кэш обработанных встреч пуст.")
 
@@ -138,160 +174,189 @@ def safe_parse_datetime(date_str):
 
 # Функция для периодической проверки и отправки уведомлений
 async def scheduled_meetings_check():
+    """Фоновая задача для проверки предстоящих встреч."""
     # Словарь для хранения уже обработанных встреч
     processed_events = {}
     
+    processed_events_file = os.path.join(DATA_DIR, 'processed_events.json')
     # Загружаем ранее обработанные события из файла, если он существует
-    if os.path.exists('processed_events.json'):
+    if os.path.exists(processed_events_file):
         try:
-            with open('processed_events.json', 'r') as f:
+            with open(processed_events_file, 'r') as f:
                 processed_events = json.load(f)
         except Exception as e:
             logging.error(f"Ошибка при загрузке обработанных событий: {e}")
     
-    # Словарь для отслеживания уведомлений о скором начале встреч
-    notified_events = {}
-    
-    logging.info(f"Запуск проверки встреч. Загружено {len(processed_events)} обработанных событий.")
+    # Словарь для хранения встреч, о начале которых уже отправлено уведомление
+    started_events = {}
+    started_events_file = os.path.join(DATA_DIR, 'started_events.json')
+    # Загружаем ранее отправленные уведомления о начале встреч
+    if os.path.exists(started_events_file):
+        try:
+            with open(started_events_file, 'r') as f:
+                started_events = json.load(f)
+        except Exception as e:
+            logging.error(f"Ошибка при загрузке начатых событий: {e}")
     
     while True:
         try:
             # Проверяем для каждого пользователя с сохраненным токеном
-            token_files = [f for f in os.listdir() if f.startswith('token_') and f.endswith('.json')]
+            token_files = [f for f in os.listdir(TOKEN_DIR) if f.startswith('token_') and f.endswith('.json')]
             
             for token_file in token_files:
                 try:
                     # Извлекаем user_id из имени файла
                     user_id = token_file.replace('token_', '').replace('.json', '')
                     
+                    # Используем начало текущего дня
+                    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
                     # Получаем события на ближайшие 7 дней
                     events = await get_upcoming_events(
-                        time_min=datetime.now(), 
-                        time_max=datetime.now() + timedelta(days=7),
+                        time_min=today, 
+                        time_max=today + timedelta(days=7, hours=23, minutes=59, seconds=59),
                         user_id=user_id
                     )
                     
                     logging.info(f"Получено {len(events)} событий из календаря для пользователя {user_id}.")
                     
-                    # Проверяем новые встречи
+                    # Текущее время для проверки предстоящих встреч
+                    now = datetime.now(timezone.utc)
+                    
                     for event in events:
-                        event_id = event['id']
-                        
-                        # Если встреча новая (не обрабатывалась ранее)
-                        if event_id not in processed_events:
-                            # Добавляем в словарь обработанных
-                            processed_events[event_id] = {
-                                'summary': event['summary'],
-                                'processed_at': datetime.now().isoformat()
-                            }
+                        # Проверяем, есть ли у события ссылка на Google Meet
+                        if 'hangoutLink' in event:
+                            event_id = event['id']
                             
-                            # Сохраняем обновленный список обработанных событий
-                            try:
-                                with open('processed_events.json', 'w') as f:
-                                    json.dump(processed_events, f)
-                            except Exception as e:
-                                logging.error(f"Ошибка при сохранении обработанных событий: {e}")
-                            
-                            # Отправляем уведомление о новой встрече
+                            # Получаем время начала события
                             start_time = event['start'].get('dateTime', event['start'].get('date'))
                             start_dt = safe_parse_datetime(start_time)
                             
-                            # Форматирование сообщения
-                            meeting_info = (
-                                f"🆕 {hbold('Новая встреча назначена!')}\n"
-                                f"📅 {hbold(event['summary'])}\n"
-                                f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')}\n"
-                            )
+                            # Получаем время окончания события
+                            end_time = event['end'].get('dateTime', event['end'].get('date'))
+                            end_dt = safe_parse_datetime(end_time)
                             
-                            # Добавляем ссылку на Google Meet, если она есть
-                            if 'hangoutLink' in event and USER_ID:
-                                meeting_info += f"🔗 [Присоединиться к встрече]({event['hangoutLink']})"
-                                await bot.send_message(USER_ID, meeting_info, parse_mode="HTML")
-                                logging.info(f"Обнаружена новая встреча: {event['summary']} (ID: {event_id})")
-                    
-                    # Проверяем встречи, которые скоро начнутся
-                    current_time = datetime.now(timezone.utc)
-                    for event in events:
-                        event_id = event['id']
-                        start_time = event['start'].get('dateTime', event['start'].get('date'))
-                        start_dt = safe_parse_datetime(start_time)
-                        
-                        # Проверяем, начинается ли встреча в течение следующих 15 минут
-                        time_until_meeting = (start_dt - current_time).total_seconds() / 60
-                        
-                        if 0 <= time_until_meeting <= 15:
-                            # Проверяем, отправляли ли мы уже уведомление для этой встречи
-                            # или прошло ли 5 минут с момента последнего уведомления
-                            if event_id not in notified_events:
-                                # Первое уведомление
-                                notified_events[event_id] = current_time.isoformat()
-                                send_notification = True
-                            else:
-                                # Проверяем, прошло ли 5 минут с момента последнего уведомления
-                                last_notification_time = notified_events[event_id]
-                                if isinstance(last_notification_time, str):
-                                    # Если время хранится как строка, преобразуем его
-                                    last_notification_time = safe_parse_datetime(last_notification_time)
-                                    notified_events[event_id] = last_notification_time
+                            # Проверяем, не обработано ли уже это событие
+                            if event_id not in processed_events:
+                                # Проверяем, начинается ли встреча в ближайшие 15 минут
+                                time_until_start = start_dt - now
                                 
-                                time_since_last = (current_time - last_notification_time).total_seconds()
-                                send_notification = time_since_last >= 300  # 5 минут
-                                
-                                if send_notification:
-                                    notified_events[event_id] = current_time.isoformat()
+                                if timedelta(0) <= time_until_start <= timedelta(minutes=15):
+                                    # Формируем сообщение о предстоящей встрече
+                                    meeting_info = (
+                                        f"🔔 {hbold('Скоро начнется встреча:')}\n\n"
+                                        f"📅 {hbold(event['summary'])}\n"
+                                        f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')} - {end_dt.strftime('%H:%M')}\n\n"
+                                    )
+                                    
+                                    # Добавляем ссылку на Google Meet, если она есть
+                                    if 'hangoutLink' in event and USER_ID:
+                                        meeting_info += f"🔗 {event['hangoutLink']}"
+                                        await bot.send_message(USER_ID, meeting_info, parse_mode="HTML")
+                                        logging.info(f"Обнаружена новая встреча: {event['summary']} (ID: {event_id})")
+                                    
+                                    # Добавляем событие в список обработанных
+                                    processed_events[event_id] = {
+                                        'summary': event['summary'],
+                                        'start_time': start_time,
+                                        'notified_at': datetime.now().isoformat()
+                                    }
+                                    
+                                    # Сохраняем обновленный список обработанных событий
+                                    try:
+                                        with open(processed_events_file, 'w') as f:
+                                            json.dump(processed_events, f)
+                                    except Exception as e:
+                                        logging.error(f"Ошибка при сохранении обработанных событий: {e}")
                             
-                            if send_notification:
-                                # Форматирование сообщения
-                                meeting_info = (
-                                    f"⚠️ {hbold('Скоро начнется встреча!')}\n"
+                            # Проверяем, началась ли встреча и не отправлено ли уже уведомление
+                            if event_id not in started_events and start_dt <= now < end_dt:
+                                # Формируем сообщение о начавшейся встрече
+                                meeting_started_info = (
+                                    f"🚀 {hbold('Встреча началась!')}\n\n"
                                     f"📅 {hbold(event['summary'])}\n"
-                                    f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')}\n"
-                                    f"⏱️ Осталось примерно {int(time_until_meeting)} минут\n"
+                                    f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')} - {end_dt.strftime('%H:%M')}\n\n"
                                 )
                                 
-                                # Добавляем ссылку на Google Meet, если она есть
-                                if 'hangoutLink' in event:
-                                    meeting_info += f"🔗 [Присоединиться к встрече]({event['hangoutLink']})"
+                                # Добавляем ссылку на Google Meet
+                                if 'hangoutLink' in event and USER_ID:
+                                    meeting_started_info += f"🔗 {event['hangoutLink']}"
+                                    await bot.send_message(USER_ID, meeting_started_info, parse_mode="HTML")
+                                    logging.info(f"Встреча началась: {event['summary']} (ID: {event_id})")
                                 
-                                if USER_ID:
-                                    await bot.send_message(USER_ID, meeting_info, parse_mode="HTML")
-                                    logging.info(f"Отправлено уведомление о скором начале встречи: {event['summary']} (через {int(time_until_meeting)} минут)")
-                    
-                    # Очищаем словарь от старых событий (прошедших)
-                    current_time = datetime.now(timezone.utc)
-                    new_processed_events = {}
-
-                    for event_id, event_data in processed_events.items():
-                        # Проверяем, есть ли это событие в текущих событиях
-                        event_still_exists = False
-                        for event in events:
-                            if event['id'] == event_id:
-                                event_still_exists = True
-                                break
-                        
-                        # Если событие всё ещё существует, сохраняем его
-                        if event_still_exists:
-                            new_processed_events[event_id] = event_data
-
-                    processed_events = new_processed_events
-
-                    # Сохраняем обновленный список обработанных событий
-                    try:
-                        with open('processed_events.json', 'w') as f:
-                            json.dump(processed_events, f)
-                    except Exception as e:
-                        logging.error(f"Ошибка при сохранении обработанных событий: {e}")
-                    
-                    logging.info(f"Очистка завершена. Осталось {len(processed_events)} обработанных событий.")
-                
+                                # Добавляем событие в список начатых
+                                started_events[event_id] = {
+                                    'summary': event['summary'],
+                                    'start_time': start_time,
+                                    'notified_at': datetime.now().isoformat()
+                                }
+                                
+                                # Сохраняем обновленный список начатых событий
+                                try:
+                                    with open(started_events_file, 'w') as f:
+                                        json.dump(started_events, f)
+                                except Exception as e:
+                                    logging.error(f"Ошибка при сохранении начатых событий: {e}")
+                            
                 except Exception as e:
                     logging.error(f"Ошибка при проверке встреч для пользователя {user_id}: {e}")
             
+            # Очистка устаревших записей в started_events (встречи, которые уже закончились)
+            now = datetime.now(timezone.utc)
+            events_to_remove = []
+            
+            for event_id, event_data in started_events.items():
+                try:
+                    end_time = event_data.get('end_time')
+                    if end_time:
+                        end_dt = safe_parse_datetime(end_time)
+                        if now > end_dt:
+                            events_to_remove.append(event_id)
+                except Exception as e:
+                    logging.error(f"Ошибка при проверке окончания встречи {event_id}: {e}")
+            
+            # Удаляем завершенные встречи из списка
+            for event_id in events_to_remove:
+                started_events.pop(event_id, None)
+            
+            # Сохраняем обновленный список начатых событий
+            if events_to_remove:
+                try:
+                    with open(started_events_file, 'w') as f:
+                        json.dump(started_events, f)
+                except Exception as e:
+                    logging.error(f"Ошибка при сохранении обновленного списка начатых событий: {e}")
+            
+            # Очистка устаревших записей в processed_events (встречи, которые уже начались)
+            now = datetime.now(timezone.utc)
+            events_to_remove = []
+            
+            for event_id, event_data in processed_events.items():
+                try:
+                    start_time = event_data.get('start_time')
+                    if start_time:
+                        start_dt = safe_parse_datetime(start_time)
+                        if now > start_dt + timedelta(minutes=30):  # Удаляем через 30 минут после начала
+                            events_to_remove.append(event_id)
+                except Exception as e:
+                    logging.error(f"Ошибка при проверке начала встречи {event_id}: {e}")
+            
+            # Удаляем начавшиеся встречи из списка
+            for event_id in events_to_remove:
+                processed_events.pop(event_id, None)
+            
+            # Сохраняем обновленный список обработанных событий
+            if events_to_remove:
+                try:
+                    with open(processed_events_file, 'w') as f:
+                        json.dump(processed_events, f)
+                except Exception as e:
+                    logging.error(f"Ошибка при сохранении обновленного списка обработанных событий: {e}")
+            
         except Exception as e:
-            logging.error(f"Ошибка при проверке встреч: {e}")
+            logging.error(f"Ошибка при проверке предстоящих встреч: {e}")
         
-        # Проверяем каждые 5 минут
-        await asyncio.sleep(int(os.getenv("CHECK_INTERVAL", 300)))
+        # Ждем 5 минут перед следующей проверкой
+        await asyncio.sleep(300)
 
 # Команда /debug для проверки настроек
 @dp.message(Command("debug"))
@@ -405,7 +470,7 @@ async def force_check_meetings(message: Message):
     user_id = message.from_user.id
     
     # Проверяем, авторизован ли пользователь
-    token_file = f'token_{user_id}.json'
+    token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
     if not os.path.exists(token_file):
         await message.answer(
             "Вы не авторизованы в Google Calendar.\n"
@@ -478,7 +543,7 @@ async def force_check_meetings(message: Message):
 @dp.message(Command("authstatus"))
 async def auth_status_command(message: Message):
     user_id = message.from_user.id
-    token_file = f'token_{user_id}.json'
+    token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
     
     if os.path.exists(token_file):
         try:
@@ -599,7 +664,7 @@ async def set_token_command(message: Message):
             return
         
         # Сохраняем токен в файл
-        token_file = f'token_{user_id}.json'
+        token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
         with open(token_file, 'w') as f:
             f.write(token_json)
         
@@ -689,6 +754,21 @@ async def auth_info_command(message: Message):
         await message.answer(auth_info, parse_mode="HTML")
     except Exception as e:
         await message.answer(f"❌ Ошибка при чтении данных клиента: {str(e)}")
+
+# Команда /notifications для настройки уведомлений
+@dp.message(Command("notifications"))
+async def notifications_settings(message: Message):
+    user_id = message.from_user.id
+    
+    await message.answer(
+        "⚙️ <b>Настройки уведомлений:</b>\n\n"
+        "Сейчас вы получаете следующие уведомления:\n"
+        "✅ За 15 минут до начала встречи\n"
+        "✅ В момент начала встречи\n\n"
+        "Для сброса всех уведомлений используйте команду /reset\n"
+        "Это позволит получить уведомления о всех текущих встречах заново.",
+        parse_mode="HTML"
+    )
 
 # Запуск бота
 async def main():
