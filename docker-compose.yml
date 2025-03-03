@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  calendar-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: calendar-notification-bot
+    restart: unless-stopped
+    volumes:
+      - ./credentials.json:/app/credentials.json:ro
+      - ./data:/data
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - USER_ID=${USER_ID}
+      - PYTHONUNBUFFERED=1
+      - TOKEN_DIR=/data/tokens
+      - DATA_DIR=/data 
