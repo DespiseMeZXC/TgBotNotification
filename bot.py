@@ -75,6 +75,8 @@ async def check_week_meetings(message: Message):
         # Получаем события на ближайшие 7 дней
         # Используем начало текущего дня
         today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        now = datetime.now(timezone.utc)
+        
         # Определяем начало недели в зависимости от текущего дня
         current_weekday = today.weekday()
         if current_weekday >= 5:  # Суббота (5) или воскресенье (6)
@@ -91,16 +93,24 @@ async def check_week_meetings(message: Message):
             user_id=user_id
         )
         
-        if not events:
+        # Фильтруем события, оставляя только те, что еще не закончились
+        active_events = []
+        for event in events:
+            end_time = event['end'].get('dateTime', event['end'].get('date'))
+            end_dt = safe_parse_datetime(end_time)
+            if end_dt > now:
+                active_events.append(event)
+        
+        if not active_events:
             await message.answer("У вас нет предстоящих встреч на неделю.")
             return
         
         # Логируем количество полученных событий
-        logging.info(f"Получено {len(events)} событий для пользователя {user_id}")
+        logging.info(f"Получено {len(active_events)} активных событий для пользователя {user_id}")
         
         # Группируем встречи по дням
         meetings_by_day = {}
-        for event in events:
+        for event in active_events:
             start_time = event['start'].get('dateTime', event['start'].get('date'))
             start_dt = safe_parse_datetime(start_time)
             day_key = start_dt.strftime('%d.%m.%Y')
@@ -112,26 +122,22 @@ async def check_week_meetings(message: Message):
         
         # Отправляем встречи по дням
         for day, day_events in sorted(meetings_by_day.items()):
-            day_message = f"📆 {hbold(f'Встречи на {day}:')}"
+            day_message = f"📆 {hbold(f'Встречи на {day}:')}\n\n"
             has_meetings = False
             
             for event in day_events:
                 start_time = event['start'].get('dateTime', event['start'].get('date'))
                 start_dt = safe_parse_datetime(start_time)
                 
-                # Добавляем все встречи
-                
                 # Если есть ссылка на Google Meet, добавляем ее
                 if 'hangoutLink' in event:
                     day_message += f"🕒 {start_dt.strftime('%H:%M')} - {hbold(event['summary'])}\n"
-                    day_message += f"🔗 {event['hangoutLink']}\n"
-                    await message.answer(day_message, parse_mode="HTML")
-                day_message += "\n"
-                has_meetings = True
+                    day_message += f"🔗 {event['hangoutLink']}\n\n"
+                    has_meetings = True
             
             # Отправляем сообщение если есть встречи
-            if not has_meetings:
-                await message.answer(f"📆 {hbold(f'На {day} нет встреч')}", parse_mode="HTML")
+            if has_meetings:
+                await message.answer(day_message, parse_mode="HTML")
     
     except Exception as e:
         logging.error(f"Ошибка при получении встреч на неделю: {e}")
@@ -142,6 +148,7 @@ async def check_week_meetings(message: Message):
 async def reset_processed_events(message: Message):
     processed_events_file = os.path.join(DATA_DIR, 'processed_events.json')
     started_events_file = os.path.join(DATA_DIR, 'started_events.json')
+    known_events_file = os.path.join(DATA_DIR, 'known_events.json')
     
     files_reset = []
     
@@ -152,6 +159,10 @@ async def reset_processed_events(message: Message):
     if os.path.exists(started_events_file):
         os.remove(started_events_file)
         files_reset.append("уведомления о начавшихся встречах")
+    
+    if os.path.exists(known_events_file):
+        os.remove(known_events_file)
+        files_reset.append("список известных встреч")
     
     if files_reset:
         await message.answer(f"Кэш сброшен: {', '.join(files_reset)}. Теперь вы получите уведомления о всех текущих встречах как о новых.")
@@ -177,8 +188,19 @@ async def scheduled_meetings_check():
     """Фоновая задача для проверки предстоящих встреч."""
     # Словарь для хранения уже обработанных встреч
     processed_events = {}
+    # Словарь для хранения известных встреч
+    known_events = {}
+    known_events_file = os.path.join(DATA_DIR, 'known_events.json')
     
     processed_events_file = os.path.join(DATA_DIR, 'processed_events.json')
+    # Загружаем известные события
+    if os.path.exists(known_events_file):
+        try:
+            with open(known_events_file, 'r') as f:
+                known_events = json.load(f)
+        except Exception as e:
+            logging.error(f"Ошибка при загрузке известных событий: {e}")
+    
     # Загружаем ранее обработанные события из файла, если он существует
     if os.path.exists(processed_events_file):
         try:
@@ -221,6 +243,40 @@ async def scheduled_meetings_check():
                     
                     # Текущее время для проверки предстоящих встреч
                     now = datetime.now(timezone.utc)
+                    
+                    # Проверяем новые встречи
+                    for event in events:
+                        event_id = event['id']
+                        
+                        # Если встреча новая (не в списке известных)
+                        if event_id not in known_events:
+                            start_time = event['start'].get('dateTime', event['start'].get('date'))
+                            start_dt = safe_parse_datetime(start_time)
+                            end_time = event['end'].get('dateTime', event['end'].get('date'))
+                            end_dt = safe_parse_datetime(end_time)
+                            
+                            # Проверяем, что встреча еще не началась
+                            if start_dt > now:
+                                # Формируем сообщение о новой встрече
+                                new_meeting_info = (
+                                    f"📅 {hbold('Новая встреча добавлена в календарь:')}\n\n"
+                                    f"📌 {hbold(event['summary'])}\n"
+                                    f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')} - {end_dt.strftime('%H:%M')}\n\n"
+                                )
+                                
+                                # Добавляем ссылку на Google Meet, если она есть
+                                if 'hangoutLink' in event:
+                                    new_meeting_info += f"🔗 {event['hangoutLink']}\n"
+                                    await bot.send_message(USER_ID, new_meeting_info, parse_mode="HTML")
+                                    logging.info(f"Обнаружена новая встреча: {event['summary']} (ID: {event_id})")
+                            
+                            # Добавляем встречу в список известных
+                            known_events[event_id] = {
+                                'summary': event['summary'],
+                                'start_time': start_time,
+                                'end_time': end_time,
+                                'discovered_at': datetime.now().isoformat()
+                            }
                     
                     for event in events:
                         # Проверяем, есть ли у события ссылка на Google Meet
@@ -352,11 +408,37 @@ async def scheduled_meetings_check():
                 except Exception as e:
                     logging.error(f"Ошибка при сохранении обновленного списка обработанных событий: {e}")
             
+            # Очистка устаревших записей в known_events (встречи, которые уже закончились)
+            now = datetime.now(timezone.utc)
+            events_to_remove = []
+            
+            for event_id, event_data in known_events.items():
+                try:
+                    end_time = event_data.get('end_time')
+                    if end_time:
+                        end_dt = safe_parse_datetime(end_time)
+                        if now > end_dt + timedelta(days=1):  # Удаляем через день после окончания
+                            events_to_remove.append(event_id)
+                except Exception as e:
+                    logging.error(f"Ошибка при проверке окончания известной встречи {event_id}: {e}")
+            
+            # Удаляем завершенные встречи из списка известных
+            for event_id in events_to_remove:
+                known_events.pop(event_id, None)
+            
+            # Сохраняем обновленный список известных встреч
+            if events_to_remove:
+                try:
+                    with open(known_events_file, 'w') as f:
+                        json.dump(known_events, f)
+                except Exception as e:
+                    logging.error(f"Ошибка при сохранении обновленного списка известных событий: {e}")
+            
         except Exception as e:
             logging.error(f"Ошибка при проверке предстоящих встреч: {e}")
         
-        # Ждем 5 минут перед следующей проверкой
-        await asyncio.sleep(300)
+        # Ждем перед следующей проверкой
+        await asyncio.sleep(int(os.getenv('CHECK_INTERVAL', 300)))
 
 # Команда /debug для проверки настроек
 @dp.message(Command("debug"))
@@ -763,6 +845,7 @@ async def notifications_settings(message: Message):
     await message.answer(
         "⚙️ <b>Настройки уведомлений:</b>\n\n"
         "Сейчас вы получаете следующие уведомления:\n"
+        "✅ При добавлении новой встречи\n"
         "✅ За 15 минут до начала встречи\n"
         "✅ В момент начала встречи\n\n"
         "Для сброса всех уведомлений используйте команду /reset\n"
