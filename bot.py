@@ -193,26 +193,27 @@ async def scheduled_meetings_check():
                     
                     now = datetime.now(timezone.utc)
                     
+                    # Получаем все известные события
+                    known_events = db.get_known_events(user_id)
+                    current_event_ids = set()
+                    
                     for event in events:
                         # Пропускаем события без ссылки на подключение
                         if 'hangoutLink' not in event:
                             continue
                             
                         event_id = event['id']
-                        start_time = event['start'].get('dateTime', event['start'].get('date'))
-                        end_time = event['end'].get('dateTime', event['end'].get('date'))
-                        start_dt = safe_parse_datetime(start_time)
-                        end_dt = safe_parse_datetime(end_time)
+                        current_event_ids.add(event_id)
                         
                         # Проверка новых встреч
                         if not db.is_event_known(event_id, user_id):
-                            db.add_known_event(event_id, event['summary'], start_time, end_time, user_id)
+                            db.add_known_event(event_id, event['summary'], event['start'].get('dateTime', event['start'].get('date')), event['end'].get('dateTime', event['end'].get('date')), user_id)
                             
-                            if start_dt > now:
+                            if safe_parse_datetime(event['start'].get('dateTime', event['start'].get('date'))) > now:
                                 new_meeting_info = (
                                     f"📅 {hbold('Новая онлайн-встреча добавлена в календарь:')}\n\n"
                                     f"📌 {hbold(event['summary'])}\n"
-                                    f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')} - {end_dt.strftime('%H:%M')}\n\n"
+                                    f"🕒 {safe_parse_datetime(event['start'].get('dateTime', event['start'].get('date'))).strftime('%d.%m.%Y %H:%M')} - {safe_parse_datetime(event['end'].get('dateTime', event['end'].get('date'))).strftime('%H:%M')}\n\n"
                                     f"🔗 {event['hangoutLink']}\n"
                                 )
                                 
@@ -260,6 +261,22 @@ async def scheduled_meetings_check():
                     
                     # Очистка старых событий
                     db.clean_old_events(now - timedelta(days=1))
+                    
+                    # Проверяем удаленные события
+                    for known_event in known_events:
+                        if known_event['event_id'] not in current_event_ids:
+                            # Событие было удалено
+                            deleted_meeting_info = (
+                                f"❌ {hbold('Онлайн-встреча отменена:')}\n\n"
+                                f"📌 {hbold(known_event['summary'])}\n"
+                                f"🕒 {safe_parse_datetime(known_event['start_time']).strftime('%d.%m.%Y %H:%M')}\n"
+                            )
+                            
+                            if USER_ID:
+                                await bot.send_message(USER_ID, deleted_meeting_info, parse_mode="HTML")
+                            
+                            # Удаляем событие из базы
+                            db.delete_known_event(known_event['event_id'], user_id)
                     
                 except Exception as e:
                     logging.error(f"Ошибка при проверке встреч для пользователя {user_id}: {e}")
@@ -400,11 +417,11 @@ async def check_command(message: Message):
             db=db
         )
         
-        if not events:
-            await message.answer("Нет предстоящих онлайн-встреч.")
-            return
-        
+        # Получаем все известные события
+        known_events = db.get_known_events(user_id)
+        current_event_ids = set()
         new_events_count = 0
+        deleted_events_count = 0
         
         # Проверяем новые встречи
         for event in events:
@@ -413,6 +430,7 @@ async def check_command(message: Message):
                 continue
                 
             event_id = event['id']
+            current_event_ids.add(event_id)
             
             # Если встреча новая
             if not db.is_event_known(event_id, user_id):
@@ -440,8 +458,24 @@ async def check_command(message: Message):
                     user_id=user_id
                 )
         
-        if new_events_count == 0:
-            await message.answer("Новых онлайн-встреч не найдено.")
+        # Проверяем удаленные события
+        for known_event in known_events:
+            if known_event['event_id'] not in current_event_ids:
+                deleted_events_count += 1
+                
+                deleted_meeting_info = (
+                    f"❌ {hbold('Онлайн-встреча отменена:')}\n\n"
+                    f"📌 {hbold(known_event['summary'])}\n"
+                    f"🕒 {safe_parse_datetime(known_event['start_time']).strftime('%d.%m.%Y %H:%M')}\n"
+                )
+                
+                await message.answer(deleted_meeting_info, parse_mode="HTML")
+                
+                # Удаляем событие из базы
+                db.delete_known_event(known_event['event_id'], user_id)
+        
+        if new_events_count == 0 and deleted_events_count == 0:
+            await message.answer("Изменений в расписании онлайн-встреч не найдено.")
             
     except Exception as e:
         logging.error(f"Ошибка при проверке встреч: {e}")

@@ -254,4 +254,37 @@ class Database:
                 'SELECT 1 FROM processed_events WHERE event_id = ? AND user_id = ?',
                 (event_id, str(user_id))
             )
-            return cursor.fetchone() is not None 
+            return cursor.fetchone() is not None
+
+    def get_known_events(self, user_id):
+        """Получение всех известных событий пользователя"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT event_id, summary, start_time, end_time 
+                FROM known_events 
+                WHERE user_id = ?
+                ''', 
+                (str(user_id),)
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    'event_id': row[0],
+                    'summary': row[1],
+                    'start_time': row[2],
+                    'end_time': row[3]
+                }
+                for row in rows
+            ]
+
+    def delete_known_event(self, event_id, user_id):
+        """Удаление известного события"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'DELETE FROM known_events WHERE event_id = ? AND user_id = ?',
+                (event_id, str(user_id))
+            )
+            conn.commit() 
