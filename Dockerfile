@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Копируем код приложения
 COPY . .
+COPY bot.py .
+COPY google_calendar.py .
+COPY database.py .
 
 # Создаем директорию для хранения данных
 RUN mkdir -p /data

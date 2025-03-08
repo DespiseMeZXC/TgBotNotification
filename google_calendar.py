@@ -16,99 +16,116 @@ load_dotenv()
 # Если изменить эти области, удалите файл token.json
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
 
-# Словарь для хранения состояний авторизации пользователей
-auth_states = {}
-
 # Директория для хранения токенов
 TOKEN_DIR = os.getenv("TOKEN_DIR", ".")
 
 # Убедимся, что директория существует
 os.makedirs(TOKEN_DIR, exist_ok=True)
 
-async def get_credentials(user_id=None):
+async def get_credentials(user_id=None, db=None):
     """Получение и обновление учетных данных Google."""
     creds = None
-    token_file = os.path.join(TOKEN_DIR, 'token.json')
     
-    # Если указан user_id, используем персональный файл токена
     if user_id:
-        token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
-    
-    # Файл token.json хранит токены доступа и обновления пользователя
-    if os.path.exists(token_file):
-        creds = Credentials.from_authorized_user_info(
-            json.loads(open(token_file).read()), SCOPES)
+        # Получаем токен из базы данных
+        token_data = db.get_token(user_id)
+        if token_data:
+            creds = Credentials.from_authorized_user_info(token_data, SCOPES)
     
     # Если нет действительных учетных данных, возвращаем None
-    # Авторизация будет запущена из бота
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
             # Сохраняем обновленные учетные данные
-            with open(token_file, 'w') as token:
-                token.write(creds.to_json())
+            if user_id and db:
+                db.save_token(user_id, json.loads(creds.to_json()))
         else:
             return None
     
     return creds
 
-def create_auth_url(user_id):
+def create_auth_url(user_id, db):
     """Создает URL для авторизации и сохраняет состояние."""
-    flow = InstalledAppFlow.from_client_secrets_file(
-        'credentials.json', 
-        SCOPES, 
-        # Используем стандартный редирект для OOB (Out-of-Band) авторизации
-        redirect_uri='urn:ietf:wg:oauth:2.0:oob'
-    )
-    
-    # Добавляем дополнительные параметры для корректного запроса
-    auth_url, state = flow.authorization_url(
-        # Запрашиваем оффлайн доступ для получения refresh_token
-        access_type='offline',
-        # Включаем prompt для гарантированного получения refresh_token
-        prompt='consent',
-        # Включаем ранее предоставленные разрешения
-        include_granted_scopes='true'
-    )
-    
-    # Сохраняем flow для последующего использования
-    auth_states[user_id] = {
-        'flow': flow,
-        'state': state
-    }
-    
-    return auth_url
-
-async def process_auth_code(user_id, code):
-    """Обрабатывает код авторизации и сохраняет токен."""
-    if user_id not in auth_states:
-        return False, "Сессия авторизации истекла. Пожалуйста, начните заново с команды /auth."
-    
-    flow = auth_states[user_id]['flow']
-    
     try:
+        # Проверяем наличие файла credentials.json
+        if not os.path.exists('credentials.json'):
+            logging.error("Файл credentials.json не найден")
+            return "Ошибка: файл credentials.json не найден"
+        
+        # Создаем flow
+        flow = InstalledAppFlow.from_client_secrets_file(
+            'credentials.json',
+            SCOPES,
+            redirect_uri='urn:ietf:wg:oauth:2.0:oob'  # Используем OOB для надежности
+        )
+        
+        # Создаем URL авторизации
+        auth_url, state = flow.authorization_url(
+            access_type='offline',
+            prompt='consent',
+            include_granted_scopes='true'
+        )
+        
+        # Сохраняем состояние авторизации в базу данных
+        flow_state = {
+            'client_id': flow.client_config['client_id'],
+            'client_secret': flow.client_config['client_secret'],
+            'state': state,
+            'scopes': SCOPES,
+            'auth_uri': flow.client_config['auth_uri'],
+            'token_uri': flow.client_config['token_uri']
+        }
+        db.save_auth_state(user_id, flow_state, flow.redirect_uri)
+        
+        return auth_url
+    except Exception as e:
+        logging.error(f"Ошибка при создании URL авторизации: {e}")
+        return f"Ошибка при создании URL авторизации: {str(e)}"
+
+async def process_auth_code(user_id, code, db):
+    """Обрабатывает код авторизации и сохраняет токен."""
+    try:
+        # Получаем сохраненное состояние
+        flow_state, redirect_uri = db.get_auth_state(user_id)
+        if not flow_state:
+            return False, "Сессия авторизации истекла. Пожалуйста, начните заново с команды /serverauth"
+        
+        # Создаем новый flow
+        flow = InstalledAppFlow.from_client_secrets_file(
+            'credentials.json',
+            SCOPES,
+            redirect_uri=redirect_uri
+        )
+        
+        # Обновляем конфигурацию flow
+        flow.client_config.update({
+            'client_id': flow_state['client_id'],
+            'client_secret': flow_state['client_secret'],
+            'auth_uri': flow_state['auth_uri'],
+            'token_uri': flow_state['token_uri']
+        })
+        
         # Обмениваем код на токены
         flow.fetch_token(code=code)
         creds = flow.credentials
         
         # Сохраняем учетные данные
-        token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
-        with open(token_file, 'w') as token:
-            token.write(creds.to_json())
+        db.save_token(user_id, json.loads(creds.to_json()))
         
-        # Удаляем состояние авторизации
-        del auth_states[user_id]
+        # Удаляем состояние авторизации из базы данных
+        db.delete_auth_state(user_id)
         
-        return True, "Авторизация успешно завершена! Теперь вы можете использовать команды бота."
+        return True, "✅ Авторизация успешно завершена! Теперь вы можете использовать команды бота."
     except Exception as e:
-        return False, f"Ошибка при обработке кода авторизации: {str(e)}"
+        logging.error(f"Ошибка при обработке кода авторизации: {e}")
+        return False, f"❌ Ошибка при обработке кода авторизации: {str(e)}"
 
-async def get_upcoming_events(limit=10, time_min=None, time_max=None, user_id=None):
+async def get_upcoming_events(limit=10, time_min=None, time_max=None, user_id=None, db=None):
     """Получение предстоящих событий из Google Calendar."""
     loop = asyncio.get_event_loop()
     
     # Получаем учетные данные
-    creds = await get_credentials(user_id)
+    creds = await get_credentials(user_id, db)
     
     # Если нет учетных данных, возвращаем пустой список
     if not creds:
