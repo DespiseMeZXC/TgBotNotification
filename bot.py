@@ -25,9 +25,6 @@ logging.basicConfig(level=logging.INFO,
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
 
-# ID пользователя, которому отправлять уведомления
-USER_ID = os.getenv("USER_ID")
-
 # Директория для хранения токенов и данных
 TOKEN_DIR = os.getenv("TOKEN_DIR", ".")
 DATA_DIR = os.getenv("DATA_DIR", ".")
@@ -37,11 +34,47 @@ os.makedirs(TOKEN_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Инициализация базы данных
-db = Database(os.path.join(DATA_DIR, 'calendar_bot.db'))
+db_path = os.path.join(DATA_DIR, 'calendar_bot.db')
+# Убедимся, что директория существует и доступна для записи
+os.makedirs(os.path.dirname(db_path), exist_ok=True)
+try:
+    # Проверяем права на запись
+    with open(db_path, 'a'):
+        pass
+except PermissionError:
+    logging.error(f"Нет прав на запись в файл базы данных: {db_path}")
+    # Пробуем изменить права
+    try:
+        os.chmod(db_path, 0o666)
+    except Exception as e:
+        logging.error(f"Не удалось изменить права доступа к базе данных: {e}")
+
+db = Database(db_path)
+
+# Функция для безопасного парсинга даты/времени
+def safe_parse_datetime(dt_string):
+    """Безопасно парсит строку даты/времени в объект datetime."""
+    if not dt_string:
+        return datetime.now(timezone.utc)
+    
+    try:
+        # Если строка содержит только дату (без времени)
+        if 'T' not in dt_string:
+            dt = datetime.fromisoformat(dt_string)
+            return dt.replace(tzinfo=timezone.utc)
+        
+        # Если строка содержит дату и время
+        dt = datetime.fromisoformat(dt_string.replace('Z', '+00:00'))
+        return dt
+    except Exception as e:
+        logging.error(f"Ошибка при парсинге даты/времени '{dt_string}': {e}")
+        return datetime.now(timezone.utc)
 
 # Команда /start
 @dp.message(Command("start"))
 async def command_start(message: Message):
+    user_id = message.from_user.id
+    
     await message.answer(
         f"Привет, {message.from_user.full_name}!\n"
         "Я буду отправлять уведомления о предстоящих созвонах в Google Meet.\n\n"
@@ -51,13 +84,8 @@ async def command_start(message: Message):
         "2. Локальная авторизация (только если бот запущен на вашем компьютере): /localauth\n"
         "3. Ручной ввод токена (для продвинутых пользователей): /manualtoken"
     )
-    user_id = message.from_user.id
-    logging.info(f"Команда /start от пользователя ID: {user_id}, имя: {message.from_user.full_name}")
     
-    # Сохраняем ID пользователя в .env файл
-    if USER_ID or USER_ID == str(user_id):
-        await message.answer(f"Ваш ID {user_id} сохранен для отправки уведомлений.")
-        logging.info(f"ID пользователя {user_id} сохранен в .env файл")
+    logging.info(f"Команда /start от пользователя ID: {user_id}, имя: {message.from_user.full_name}")
 
 # Команда /week для просмотра встреч на неделю
 @dp.message(Command("week"))
@@ -175,13 +203,10 @@ async def scheduled_meetings_check():
     """Фоновая задача для проверки предстоящих встреч."""
     while True:
         try:
-            # Получаем всех пользователей с токенами из базы данных
-            with db.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT user_id FROM tokens')
-                users = cursor.fetchall()
+            # Получаем всех пользователей с токенами
+            users = db.get_all_users()
             
-            for (user_id,) in users:
+            for user_id in users:
                 try:
                     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
                     events = await get_upcoming_events(
@@ -192,6 +217,7 @@ async def scheduled_meetings_check():
                     )
                     
                     now = datetime.now(timezone.utc)
+                    settings = db.get_user_settings(user_id)
                     
                     # Получаем все известные события
                     known_events = db.get_known_events(user_id)
@@ -204,29 +230,33 @@ async def scheduled_meetings_check():
                             
                         event_id = event['id']
                         current_event_ids.add(event_id)
+                        start_time = event['start'].get('dateTime', event['start'].get('date'))
+                        end_time = event['end'].get('dateTime', event['end'].get('date'))
+                        start_dt = safe_parse_datetime(start_time)
+                        end_dt = safe_parse_datetime(end_time)
                         
                         # Проверка новых встреч
                         if not db.is_event_known(event_id, user_id):
-                            db.add_known_event(event_id, event['summary'], event['start'].get('dateTime', event['start'].get('date')), event['end'].get('dateTime', event['end'].get('date')), user_id)
+                            db.add_known_event(event_id, event['summary'], start_time, end_time, user_id)
+                            # Добавляем в статистику как предстоящую встречу
+                            db.update_meeting_stats(event_id, user_id, event['summary'], start_time, end_time, 'upcoming')
                             
-                            if safe_parse_datetime(event['start'].get('dateTime', event['start'].get('date'))) > now:
+                            if start_dt > now and settings['notify_new']:
                                 new_meeting_info = (
                                     f"📅 {hbold('Новая онлайн-встреча добавлена в календарь:')}\n\n"
                                     f"📌 {hbold(event['summary'])}\n"
-                                    f"🕒 {safe_parse_datetime(event['start'].get('dateTime', event['start'].get('date'))).strftime('%d.%m.%Y %H:%M')} - {safe_parse_datetime(event['end'].get('dateTime', event['end'].get('date'))).strftime('%H:%M')}\n\n"
+                                    f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')} - {end_dt.strftime('%H:%M')}\n\n"
                                     f"🔗 {event['hangoutLink']}\n"
                                 )
                                 
-                                if USER_ID:
-                                    await bot.send_message(USER_ID, new_meeting_info, parse_mode="HTML")
+                                await bot.send_message(user_id, new_meeting_info, parse_mode="HTML")
                         
                         # Проверка предстоящих встреч
                         if not db.is_event_processed(event_id, user_id):
-                            start_time = event['start'].get('dateTime', event['start'].get('date'))
-                            start_dt = safe_parse_datetime(start_time)
                             time_until_start = start_dt - now
+                            reminder_minutes = settings['reminder_time']
                             
-                            if timedelta(0) <= time_until_start <= timedelta(minutes=15):
+                            if timedelta(0) <= time_until_start <= timedelta(minutes=reminder_minutes):
                                 meeting_info = (
                                     f"🔔 {hbold('Скоро начнется онлайн-встреча:')}\n\n"
                                     f"📅 {hbold(event['summary'])}\n"
@@ -234,18 +264,12 @@ async def scheduled_meetings_check():
                                     f"🔗 {event['hangoutLink']}\n"
                                 )
                                 
-                                if USER_ID:
-                                    await bot.send_message(USER_ID, meeting_info, parse_mode="HTML")
+                                await bot.send_message(user_id, meeting_info, parse_mode="HTML")
                                 
                                 db.save_processed_event(event_id, event['summary'], start_time, user_id)
                         
                         # Проверка начавшихся встреч
-                        if not db.is_event_started(event_id, user_id):
-                            start_time = event['start'].get('dateTime', event['start'].get('date'))
-                            end_time = event['end'].get('dateTime', event['end'].get('date'))
-                            start_dt = safe_parse_datetime(start_time)
-                            end_dt = safe_parse_datetime(end_time)
-                            
+                        if not db.is_event_started(event_id, user_id) and settings['notify_start']:
                             if start_dt <= now < end_dt:
                                 meeting_started_info = (
                                     f"🚀 {hbold('Онлайн-встреча началась!')}\n\n"
@@ -254,29 +278,55 @@ async def scheduled_meetings_check():
                                     f"🔗 {event['hangoutLink']}\n"
                                 )
                                 
-                                if USER_ID:
-                                    await bot.send_message(USER_ID, meeting_started_info, parse_mode="HTML")
+                                await bot.send_message(user_id, meeting_started_info, parse_mode="HTML")
                                 
                                 db.add_started_event(event_id, event['summary'], start_time, end_time, user_id)
+                                
+                                # Обновляем статистику для завершенных встреч
+                                if now > end_dt:
+                                    db.update_meeting_stats(event_id, user_id, event['summary'], start_time, end_time, 'completed')
+                    
+                    # Проверяем удаленные события
+                    if settings['notify_cancel']:
+                        for known_event in known_events:
+                            if known_event['event_id'] not in current_event_ids:
+                                # Событие было удалено
+                                deleted_meeting_info = (
+                                    f"❌ {hbold('Онлайн-встреча отменена:')}\n\n"
+                                    f"📌 {hbold(known_event['summary'])}\n"
+                                    f"🕒 {safe_parse_datetime(known_event['start_time']).strftime('%d.%m.%Y %H:%M')}\n"
+                                )
+                                
+                                await bot.send_message(user_id, deleted_meeting_info, parse_mode="HTML")
+                                
+                                # Обновляем статистику для отмененных встреч
+                                db.update_meeting_stats(
+                                    known_event['event_id'], 
+                                    user_id, 
+                                    known_event['summary'], 
+                                    known_event['start_time'], 
+                                    known_event['end_time'], 
+                                    'cancelled'
+                                )
+                                
+                                # Удаляем событие из базы
+                                db.delete_known_event(known_event['event_id'], user_id)
+                    else:
+                        # Если уведомления отключены, просто удаляем события из базы
+                        for known_event in known_events:
+                            if known_event['event_id'] not in current_event_ids:
+                                db.update_meeting_stats(
+                                    known_event['event_id'], 
+                                    user_id, 
+                                    known_event['summary'], 
+                                    known_event['start_time'], 
+                                    known_event['end_time'], 
+                                    'cancelled'
+                                )
+                                db.delete_known_event(known_event['event_id'], user_id)
                     
                     # Очистка старых событий
                     db.clean_old_events(now - timedelta(days=1))
-                    
-                    # Проверяем удаленные события
-                    for known_event in known_events:
-                        if known_event['event_id'] not in current_event_ids:
-                            # Событие было удалено
-                            deleted_meeting_info = (
-                                f"❌ {hbold('Онлайн-встреча отменена:')}\n\n"
-                                f"📌 {hbold(known_event['summary'])}\n"
-                                f"🕒 {safe_parse_datetime(known_event['start_time']).strftime('%d.%m.%Y %H:%M')}\n"
-                            )
-                            
-                            if USER_ID:
-                                await bot.send_message(USER_ID, deleted_meeting_info, parse_mode="HTML")
-                            
-                            # Удаляем событие из базы
-                            db.delete_known_event(known_event['event_id'], user_id)
                     
                 except Exception as e:
                     logging.error(f"Ошибка при проверке встреч для пользователя {user_id}: {e}")
@@ -292,7 +342,6 @@ async def debug_info(message: Message):
     debug_message = (
         f"🔍 Отладочная информация:\n"
         f"- Ваш ID: {message.from_user.id}\n"
-        f"- Сохраненный USER_ID: {USER_ID}\n"
     )
     
     # Проверяем файл processed_events.json
@@ -519,60 +568,42 @@ async def auth_status_command(message: Message):
 async def local_auth_command(message: Message):
     user_id = message.from_user.id
     
-    await message.answer(
-        "Запускаю локальный сервер для авторизации в Google Calendar...\n"
-        "Сейчас в вашем браузере должно открыться окно авторизации.\n"
-        "Пожалуйста, следуйте инструкциям в браузере."
-    )
+    await message.answer("🔄 Запускаю локальный сервер авторизации...")
     
-    # Запускаем процесс авторизации в отдельной задаче
-    asyncio.create_task(run_local_auth(message, user_id))
-
-async def run_local_auth(message, user_id):
     try:
-        # Запускаем локальный сервер для авторизации
-        creds = await get_credentials_with_local_server(user_id)
+        # Запускаем локальный сервер авторизации
+        creds = await get_credentials_with_local_server()
         
         if creds:
-            # Если авторизация успешна, обновляем USER_ID
+            # Сохраняем токен в базу данных
+            db.save_token(user_id, json.loads(creds.to_json()))
+            
+            # Сохраняем учетные данные
+            token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
+            with open(token_file, 'w') as token:
+                token.write(creds.to_json())
+            
+            await message.answer(
+                "✅ Авторизация успешно завершена!\n\n"
+                "Теперь вы можете использовать команды бота:\n"
+                "/check - проверить предстоящие встречи\n"
+                "/week - показать встречи на неделю"
+            )
+            
+            # Обновляем USER_ID
             global USER_ID
             USER_ID = str(user_id)
-            
-            # Сохраняем USER_ID в .env файл
-            env_path = '.env'
-            env_lines = []
-            
-            if os.path.exists(env_path):
-                with open(env_path, 'r') as f:
-                    env_lines = f.readlines()
-            
-            # Обновляем или добавляем USER_ID
-            user_id_found = False
-            for i, line in enumerate(env_lines):
-                if line.startswith('USER_ID='):
-                    env_lines[i] = f'USER_ID={user_id}\n'
-                    user_id_found = True
-                    break
-            
-            if not user_id_found:
-                env_lines.append(f'USER_ID={user_id}\n')
-            
-            # Записываем обновленный .env файл
-            with open(env_path, 'w') as f:
-                f.writelines(env_lines)
-            
-            await message.answer(
-                "✅ Авторизация успешно завершена!\n"
-                "Теперь вы можете использовать команды /week и /check для работы с календарем."
-            )
         else:
             await message.answer(
-                "❌ Не удалось выполнить авторизацию.\n"
-                "Пожалуйста, попробуйте еще раз или обратитесь к разработчику."
+                "❌ Не удалось получить учетные данные.\n"
+                "Попробуйте другой способ авторизации: /serverauth"
             )
     except Exception as e:
         logging.error(f"Ошибка при локальной авторизации: {e}")
-        await message.answer(f"❌ Произошла ошибка при авторизации: {str(e)}")
+        await message.answer(
+            f"❌ Произошла ошибка при авторизации: {str(e)}\n"
+            "Попробуйте другой способ авторизации: /serverauth"
+        )
 
 # Команда /manualtoken для ручного создания токена
 @dp.message(Command("manualtoken"))
@@ -712,6 +743,91 @@ async def notifications_settings(message: Message):
         "Это позволит получить уведомления о всех текущих встречах заново.",
         parse_mode="HTML"
     )
+
+@dp.message(Command("settings"))
+async def notification_settings(message: Message):
+    """Позволяет пользователю настроить время и тип уведомлений"""
+    user_id = message.from_user.id
+    settings = db.get_user_settings(user_id)
+    
+    await message.answer(
+        "⚙️ Настройки уведомлений:\n\n"
+        f"1️⃣ Время предварительного уведомления: {settings['reminder_time']} минут\n"
+        "/set_reminder 5 - за 5 минут\n"
+        "/set_reminder 15 - за 15 минут\n"
+        "/set_reminder 30 - за 30 минут\n\n"
+        "2️⃣ Статус уведомлений:\n"
+        f"🆕 Новые встречи: {'✅' if settings['notify_new'] else '❌'}\n"
+        f"🚀 Начало встречи: {'✅' if settings['notify_start'] else '❌'}\n"
+        f"❌ Отмена встречи: {'✅' if settings['notify_cancel'] else '❌'}\n\n"
+        "Используйте команды для изменения настроек:\n"
+        "/toggle_new - новые встречи\n"
+        "/toggle_start - начало встречи\n"
+        "/toggle_cancel - отмена встречи"
+    )
+
+@dp.message(Command("set_reminder"))
+async def set_reminder_time(message: Message):
+    """Установка времени напоминания"""
+    try:
+        user_id = message.from_user.id
+        time = int(message.text.split()[1])
+        if time not in [5, 15, 30]:
+            await message.answer("❌ Доступные значения: 5, 15 или 30 минут")
+            return
+        
+        db.update_user_setting(user_id, 'reminder_time', time)
+        await message.answer(f"✅ Время напоминания установлено на {time} минут")
+    except (ValueError, IndexError):
+        await message.answer("❌ Используйте формат: /set_reminder <минуты>")
+
+@dp.message(Command("toggle_new"))
+async def toggle_new_notifications(message: Message):
+    """Включение/выключение уведомлений о новых встречах"""
+    user_id = message.from_user.id
+    settings = db.get_user_settings(user_id)
+    new_value = not settings['notify_new']
+    db.update_user_setting(user_id, 'notify_new', new_value)
+    status = "включены ✅" if new_value else "выключены ❌"
+    await message.answer(f"Уведомления о новых встречах {status}")
+
+@dp.message(Command("toggle_start"))
+async def toggle_start_notifications(message: Message):
+    """Включение/выключение уведомлений о начале встреч"""
+    user_id = message.from_user.id
+    settings = db.get_user_settings(user_id)
+    new_value = not settings['notify_start']
+    db.update_user_setting(user_id, 'notify_start', new_value)
+    status = "включены ✅" if new_value else "выключены ❌"
+    await message.answer(f"Уведомления о начале встреч {status}")
+
+@dp.message(Command("toggle_cancel"))
+async def toggle_cancel_notifications(message: Message):
+    """Включение/выключение уведомлений об отмене встреч"""
+    user_id = message.from_user.id
+    settings = db.get_user_settings(user_id)
+    new_value = not settings['notify_cancel']
+    db.update_user_setting(user_id, 'notify_cancel', new_value)
+    status = "включены ✅" if new_value else "выключены ❌"
+    await message.answer(f"Уведомления об отмене встреч {status}")
+
+@dp.message(Command("stats"))
+async def meeting_stats(message: Message):
+    """Показывает статистику встреч"""
+    user_id = message.from_user.id
+    try:
+        stats = db.get_user_stats(user_id)
+        await message.answer(
+            "📊 Статистика встреч:\n\n"
+            f"Всего встреч: {stats['total']}\n"
+            f"Проведено: {stats['completed']}\n"
+            f"Отменено: {stats['cancelled']}\n"
+            f"Предстоит: {stats['upcoming']}\n"
+            f"Общая длительность: {stats['total_duration']} часов"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка при получении статистики: {e}")
+        await message.answer(f"❌ Ошибка при получении статистики: {str(e)}")
 
 # Запуск бота
 async def main():

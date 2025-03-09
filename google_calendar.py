@@ -177,24 +177,13 @@ async def get_upcoming_events(limit=10, time_min=None, time_max=None, user_id=No
     # Возвращаем все события, а не только с Google Meet
     return events
 
-async def get_credentials_with_local_server(user_id):
-    """Получение учетных данных через локальный сервер."""
-    token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
-    
+async def get_credentials_with_local_server():
+    """Получение учетных данных с использованием локального сервера."""
     try:
-        # Создаем flow с локальным сервером
-        flow = InstalledAppFlow.from_client_secrets_file(
-            'credentials.json', SCOPES)
-        
-        # Запускаем локальный сервер для авторизации в отдельном потоке
-        loop = asyncio.get_event_loop()
-        creds = await loop.run_in_executor(None, lambda: flow.run_local_server(port=0))
-        
-        # Сохраняем учетные данные
-        with open(token_file, 'w') as token:
-            token.write(creds.to_json())
-        
+        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+        creds = flow.run_local_server(port=0)
+        logging.info("Успешно получены учетные данные через локальный сервер")
         return creds
     except Exception as e:
-        logging.error(f"Ошибка при авторизации через локальный сервер: {e}")
+        logging.error(f"Ошибка при получении учетных данных через локальный сервер: {e}")
         return None 

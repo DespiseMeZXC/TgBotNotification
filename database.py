@@ -70,6 +70,30 @@ class Database:
                 )
             ''')
             
+            # Таблица для хранения настроек пользователя
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id TEXT PRIMARY KEY,
+                    reminder_time INTEGER DEFAULT 15,
+                    notify_new BOOLEAN DEFAULT 1,
+                    notify_start BOOLEAN DEFAULT 1,
+                    notify_cancel BOOLEAN DEFAULT 1
+                )
+            ''')
+            
+            # Таблица для хранения статистики встреч
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS meeting_stats (
+                    event_id TEXT PRIMARY KEY,
+                    user_id TEXT,
+                    summary TEXT,
+                    start_time TEXT,
+                    end_time TEXT,
+                    status TEXT,  -- 'completed', 'cancelled', 'upcoming'
+                    duration_minutes INTEGER
+                )
+            ''')
+            
             conn.commit()
 
     @contextmanager
@@ -287,4 +311,94 @@ class Database:
                 'DELETE FROM known_events WHERE event_id = ? AND user_id = ?',
                 (event_id, str(user_id))
             )
-            conn.commit() 
+            conn.commit()
+
+    def get_user_settings(self, user_id):
+        """Получение настроек пользователя"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)',
+                (str(user_id),)
+            )
+            conn.commit()
+            
+            cursor.execute(
+                'SELECT reminder_time, notify_new, notify_start, notify_cancel FROM user_settings WHERE user_id = ?',
+                (str(user_id),)
+            )
+            result = cursor.fetchone()
+            return {
+                'reminder_time': result[0],
+                'notify_new': bool(result[1]),
+                'notify_start': bool(result[2]),
+                'notify_cancel': bool(result[3])
+            }
+
+    def update_user_setting(self, user_id, setting, value):
+        """Обновление настройки пользователя"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f'UPDATE user_settings SET {setting} = ? WHERE user_id = ?',
+                (value, str(user_id))
+            )
+            conn.commit()
+
+    def update_meeting_stats(self, event_id, user_id, summary, start_time, end_time, status):
+        """Обновление статистики встреч"""
+        from datetime import datetime
+        start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00')) if isinstance(start_time, str) else start_time
+        end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00')) if isinstance(end_time, str) else end_time
+        duration = int((end_dt - start_dt).total_seconds() / 60)
+        
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                INSERT OR REPLACE INTO meeting_stats 
+                (event_id, user_id, summary, start_time, end_time, status, duration_minutes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (event_id, str(user_id), summary, start_time.isoformat() if hasattr(start_time, 'isoformat') else start_time,
+                 end_time.isoformat() if hasattr(end_time, 'isoformat') else end_time, status, duration)
+            )
+            conn.commit()
+
+    def get_user_stats(self, user_id):
+        """Получение статистики пользователя"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Общее количество встреч
+            cursor.execute('SELECT COUNT(*) FROM meeting_stats WHERE user_id = ?', (str(user_id),))
+            total = cursor.fetchone()[0]
+            
+            # Количество по статусам
+            cursor.execute('SELECT COUNT(*) FROM meeting_stats WHERE user_id = ? AND status = ?', (str(user_id), 'completed'))
+            completed = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM meeting_stats WHERE user_id = ? AND status = ?', (str(user_id), 'cancelled'))
+            cancelled = cursor.fetchone()[0]
+            
+            cursor.execute('SELECT COUNT(*) FROM meeting_stats WHERE user_id = ? AND status = ?', (str(user_id), 'upcoming'))
+            upcoming = cursor.fetchone()[0]
+            
+            # Общая длительность в минутах
+            cursor.execute('SELECT SUM(duration_minutes) FROM meeting_stats WHERE user_id = ?', (str(user_id),))
+            total_minutes = cursor.fetchone()[0] or 0
+            
+            return {
+                'total': total,
+                'completed': completed,
+                'cancelled': cancelled,
+                'upcoming': upcoming,
+                'total_duration': round(total_minutes / 60, 1)  # конвертируем в часы
+            }
+
+    def get_all_users(self):
+        """Получение всех пользователей с токенами"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT user_id FROM tokens')
+            return [row[0] for row in cursor.fetchall()] 
