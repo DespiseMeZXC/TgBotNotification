@@ -1,0 +1,28 @@
+version: '3'
+
+tasks:
+  restart:
+    desc: Перезапуск контейнеров
+    cmds:
+      - docker compose down
+      - docker compose up -d --build
+
+  up:
+    desc: Запуск контейнеров
+    cmds:
+      - docker compose up -d --build
+
+  down:
+    desc: Остановка контейнеров
+    cmds:
+      - docker compose down
+
+  logs:
+    desc: Просмотр логов
+    cmds:
+      - docker compose logs -f
+
+  ps:
+    desc: Просмотр запущенных контейнеров
+    cmds:
+      - docker compose ps
