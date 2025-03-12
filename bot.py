@@ -26,11 +26,9 @@ bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
 
 # Директория для хранения токенов и данных
-TOKEN_DIR = os.getenv("TOKEN_DIR", ".")
 DATA_DIR = os.getenv("DATA_DIR", ".")
 
 # Убедимся, что директории существуют
-os.makedirs(TOKEN_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # Инициализация базы данных
@@ -50,25 +48,6 @@ except PermissionError:
         logging.error(f"Не удалось изменить права доступа к базе данных: {e}")
 
 db = Database(db_path)
-
-# Функция для безопасного парсинга даты/времени
-def safe_parse_datetime(dt_string):
-    """Безопасно парсит строку даты/времени в объект datetime."""
-    if not dt_string:
-        return datetime.now(timezone.utc)
-    
-    try:
-        # Если строка содержит только дату (без времени)
-        if 'T' not in dt_string:
-            dt = datetime.fromisoformat(dt_string)
-            return dt.replace(tzinfo=timezone.utc)
-        
-        # Если строка содержит дату и время
-        dt = datetime.fromisoformat(dt_string.replace('Z', '+00:00'))
-        return dt
-    except Exception as e:
-        logging.error(f"Ошибка при парсинге даты/времени '{dt_string}': {e}")
-        return datetime.now(timezone.utc)
 
 # Команда /start
 @dp.message(Command("start"))
@@ -110,13 +89,13 @@ async def check_week_meetings(message: Message):
         # Определяем начало недели
         current_weekday = today.weekday()
         if current_weekday >= 5:  # Суббота (5) или воскресенье (6)
-            week_start = today + timedelta(days=(7 - current_weekday))
+            week_start = today + timedelta(days=(6 - current_weekday))
         else:
             week_start = today - timedelta(days=current_weekday)
             
         events = await get_upcoming_events(
             time_min=week_start,
-            time_max=week_start + timedelta(days=7),
+            time_max=week_start + timedelta(days=6),
             limit=20,
             user_id=user_id,
             db=db
@@ -177,8 +156,6 @@ async def reset_processed_events(message: Message):
     try:
         # Сбрасываем все данные в базе
         db.reset_all()
-        # Удаляем токен пользователя
-        db.delete_token(message.from_user.id)
         await message.answer("✅ Все данные успешно сброшены. Теперь вы получите уведомления о всех текущих встречах как о новых.")
     except Exception as e:
         logging.error(f"Ошибка при сбросе данных: {e}")
@@ -198,180 +175,94 @@ def safe_parse_datetime(date_str):
         logging.error(f"Ошибка при парсинге даты {date_str}: {e}")
         return datetime.now(timezone.utc)
 
-# Функция для периодической проверки и отправки уведомлений
+async def get_upcoming_meetings(user_id):
+    """Получает предстоящие встречи для конкретного пользователя."""
+    meetings = set()
+    try:
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        events = await get_upcoming_events(
+            time_min=today,
+            time_max=today + timedelta(days=6),
+            user_id=user_id,
+            db=db
+        )
+        
+        for event in events:
+            if 'hangoutLink' in event:
+                meetings.add((event['id'], event['summary'], event['hangoutLink'], event['start'].get('dateTime', event['start'].get('date'))))
+    except Exception as e:
+        logging.error(f"Ошибка при получении встреч для пользователя {user_id}: {e}")
+    
+    return meetings
+
+async def notify_about_meeting(meeting, user_id):
+    """Отправляет уведомление о новой встрече конкретному пользователю."""
+    event_id, summary, hangout_link, start_time = meeting
+    try:
+        # Проверяем, было ли уже отправлено уведомление
+        if not db.is_notification_sent(event_id, user_id):
+            start_dt = safe_parse_datetime(start_time)
+            meeting_info = (
+                f"📅 {hbold('Найдена новая онлайн-встреча:')}\n\n"
+                f"📌 {hbold(summary)}\n"
+                f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')}\n"
+                f"🔗 {hangout_link}\n"
+            )
+            await bot.send_message(
+                user_id,
+                meeting_info,
+                parse_mode="HTML"
+            )
+            # Помечаем встречу как известную и уведомление как отправленное
+            db.add_known_event(event_id, summary, start_time, None, user_id, notification_sent=True)
+            logging.info(f"Отправлено уведомление пользователю {user_id} о встрече {summary}")
+    except Exception as e:
+        logging.error(f"Ошибка при отправке уведомления пользователю {user_id}: {e}")
+
 async def scheduled_meetings_check():
-    """Фоновая задача для проверки предстоящих встреч."""
+    """Периодическая проверка новых встреч для всех пользователей"""
+    user_first_run = {}  # Словарь для отслеживания первого запуска для каждого пользователя
+    
     while True:
         try:
-            # Получаем всех пользователей с токенами
             users = db.get_all_users()
+            logging.info(f"Проверка встреч для {len(users)} пользователей")
             
             for user_id in users:
-                try:
-                    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-                    events = await get_upcoming_events(
-                        time_min=today,
-                        time_max=today + timedelta(days=7, hours=23, minutes=59, seconds=59),
-                        user_id=user_id,
-                        db=db
-                    )
-                    
-                    now = datetime.now(timezone.utc)
-                    settings = db.get_user_settings(user_id)
-                    
-                    # Получаем все известные события
-                    known_events = db.get_known_events(user_id)
-                    current_event_ids = set()
-                    
-                    for event in events:
-                        # Пропускаем события без ссылки на подключение
-                        if 'hangoutLink' not in event:
-                            continue
-                            
-                        event_id = event['id']
-                        current_event_ids.add(event_id)
-                        start_time = event['start'].get('dateTime', event['start'].get('date'))
-                        end_time = event['end'].get('dateTime', event['end'].get('date'))
-                        start_dt = safe_parse_datetime(start_time)
-                        end_dt = safe_parse_datetime(end_time)
+                # Инициализируем first_run для нового пользователя
+                if user_id not in user_first_run:
+                    user_first_run[user_id] = True
+                    logging.info(f"Первый запуск для пользователя {user_id}")
+                
+                # Получаем текущие встречи для пользователя
+                current_meetings = await get_upcoming_meetings(user_id)
+                
+                if not user_first_run[user_id]:
+                    # Проверяем каждую встречу отдельно
+                    for meeting in current_meetings:
+                        event_id, summary, hangout_link, start_time = meeting
                         
-                        # Проверка новых встреч
-                        if not db.is_event_known(event_id, user_id):
-                            db.add_known_event(event_id, event['summary'], start_time, end_time, user_id)
-                            # Добавляем в статистику как предстоящую встречу
-                            db.update_meeting_stats(event_id, user_id, event['summary'], start_time, end_time, 'upcoming')
-                            
-                            if start_dt > now and settings['notify_new']:
-                                new_meeting_info = (
-                                    f"📅 {hbold('Новая онлайн-встреча добавлена в календарь:')}\n\n"
-                                    f"📌 {hbold(event['summary'])}\n"
-                                    f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')} - {end_dt.strftime('%H:%M')}\n\n"
-                                    f"🔗 {event['hangoutLink']}\n"
-                                )
-                                
-                                await bot.send_message(user_id, new_meeting_info, parse_mode="HTML")
+                        # Проверяем, было ли уже отправлено уведомление
+                        if not db.is_notification_sent(event_id, user_id):
+                            await notify_about_meeting(meeting, user_id)
                         
-                        # Проверка предстоящих встреч
-                        if not db.is_event_processed(event_id, user_id):
-                            time_until_start = start_dt - now
-                            reminder_minutes = settings['reminder_time']
-                            
-                            if timedelta(0) <= time_until_start <= timedelta(minutes=reminder_minutes):
-                                meeting_info = (
-                                    f"🔔 {hbold('Скоро начнется онлайн-встреча:')}\n\n"
-                                    f"📅 {hbold(event['summary'])}\n"
-                                    f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')}\n\n"
-                                    f"🔗 {event['hangoutLink']}\n"
-                                )
-                                
-                                await bot.send_message(user_id, meeting_info, parse_mode="HTML")
-                                
-                                db.save_processed_event(event_id, event['summary'], start_time, user_id)
-                        
-                        # Проверка начавшихся встреч
-                        if not db.is_event_started(event_id, user_id) and settings['notify_start']:
-                            if start_dt <= now < end_dt:
-                                meeting_started_info = (
-                                    f"🚀 {hbold('Онлайн-встреча началась!')}\n\n"
-                                    f"📅 {hbold(event['summary'])}\n"
-                                    f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')} - {end_dt.strftime('%H:%M')}\n\n"
-                                    f"🔗 {event['hangoutLink']}\n"
-                                )
-                                
-                                await bot.send_message(user_id, meeting_started_info, parse_mode="HTML")
-                                
-                                db.add_started_event(event_id, event['summary'], start_time, end_time, user_id)
-                                
-                                # Обновляем статистику для завершенных встреч
-                                if now > end_dt:
-                                    db.update_meeting_stats(event_id, user_id, event['summary'], start_time, end_time, 'completed')
-                    
-                    # Проверяем удаленные события
-                    if settings['notify_cancel']:
-                        for known_event in known_events:
-                            if known_event['event_id'] not in current_event_ids:
-                                # Событие было удалено
-                                deleted_meeting_info = (
-                                    f"❌ {hbold('Онлайн-встреча отменена:')}\n\n"
-                                    f"📌 {hbold(known_event['summary'])}\n"
-                                    f"🕒 {safe_parse_datetime(known_event['start_time']).strftime('%d.%m.%Y %H:%M')}\n"
-                                )
-                                
-                                await bot.send_message(user_id, deleted_meeting_info, parse_mode="HTML")
-                                
-                                # Обновляем статистику для отмененных встреч
-                                db.update_meeting_stats(
-                                    known_event['event_id'], 
-                                    user_id, 
-                                    known_event['summary'], 
-                                    known_event['start_time'], 
-                                    known_event['end_time'], 
-                                    'cancelled'
-                                )
-                                
-                                # Удаляем событие из базы
-                                db.delete_known_event(known_event['event_id'], user_id)
-                    else:
-                        # Если уведомления отключены, просто удаляем события из базы
-                        for known_event in known_events:
-                            if known_event['event_id'] not in current_event_ids:
-                                db.update_meeting_stats(
-                                    known_event['event_id'], 
-                                    user_id, 
-                                    known_event['summary'], 
-                                    known_event['start_time'], 
-                                    known_event['end_time'], 
-                                    'cancelled'
-                                )
-                                db.delete_known_event(known_event['event_id'], user_id)
-                    
-                    # Очистка старых событий
-                    db.clean_old_events(now - timedelta(days=1))
-                    
-                except Exception as e:
-                    logging.error(f"Ошибка при проверке встреч для пользователя {user_id}: {e}")
+                else:
+                    # При первом запуске добавляем все текущие встречи как известные
+                    for meeting in current_meetings:
+                        event_id, summary, _, _ = meeting
+                        db.add_known_event(event_id, summary, None, None, user_id, notification_sent=True)
+                    user_first_run[user_id] = False
+                    logging.info(f"Первый запуск завершен для пользователя {user_id}, добавлено {len(current_meetings)} встреч")
             
+            # Очистка словаря first_run от пользователей, которых больше нет в базе
+            for user_id in list(user_first_run.keys()):
+                if user_id not in users:
+                    del user_first_run[user_id]
+            
+            await asyncio.sleep(int(os.getenv('CHECK_INTERVAL', 300)))
         except Exception as e:
-            logging.error(f"Ошибка при проверке предстоящих встреч: {e}")
-        
-        await asyncio.sleep(int(os.getenv('CHECK_INTERVAL', 300)))
-
-# Команда /debug для проверки настроек
-@dp.message(Command("debug"))
-async def debug_info(message: Message):
-    debug_message = (
-        f"🔍 Отладочная информация:\n"
-        f"- Ваш ID: {message.from_user.id}\n"
-    )
-    
-    # Проверяем файл processed_events.json
-    if os.path.exists('processed_events.json'):
-        try:
-            with open('processed_events.json', 'r') as f:
-                processed = json.load(f)
-                debug_message += f"- Обработанных встреч: {len(processed)}\n"
-        except Exception as e:
-            debug_message += f"- Ошибка чтения processed_events.json: {e}\n"
-    else:
-        debug_message += "- Файл processed_events.json не существует\n"
-    
-    # Проверяем последние события
-    try:
-        events = await get_upcoming_events(limit=3)
-        debug_message += f"- Ближайших событий: {len(events)}\n"
-        
-        if events:
-            debug_message += "\nПоследние события:\n"
-            for event in events[:3]:
-                start_time = event['start'].get('dateTime', event['start'].get('date'))
-                start_dt = safe_parse_datetime(start_time)
-                debug_message += f"  • {event['summary']} ({start_dt.strftime('%d.%m.%Y %H:%M')})\n"
-                debug_message += f"    ID: {event['id']}\n"
-                debug_message += f"    Meet: {'Да' if 'hangoutLink' in event else 'Нет'}\n"
-    except Exception as e:
-        debug_message += f"- Ошибка получения событий: {e}\n"
-    
-    await message.answer(debug_message)
+            logging.error(f"Ошибка при проверке встреч: {e}")
+            await asyncio.sleep(int(os.getenv('CHECK_INTERVAL', 300)))
 
 # Команда /auth для авторизации в Google Calendar
 @dp.message(Command("auth"))
@@ -471,8 +362,9 @@ async def check_command(message: Message):
         current_event_ids = set()
         new_events_count = 0
         deleted_events_count = 0
+        changed_events_count = 0
         
-        # Проверяем новые встречи
+        # Проверяем новые и измененные встречи
         for event in events:
             # Пропускаем события без ссылки на подключение
             if 'hangoutLink' not in event:
@@ -481,13 +373,18 @@ async def check_command(message: Message):
             event_id = event['id']
             current_event_ids.add(event_id)
             
-            # Если встреча новая
-            if not db.is_event_known(event_id, user_id):
+            # Получаем время начала и окончания встречи
+            start_time = event['start'].get('dateTime', event['start'].get('date'))
+            end_time = event['end'].get('dateTime', event['end'].get('date'))
+            start_dt = safe_parse_datetime(start_time)
+            
+            # Проверяем, было ли уже отправлено уведомление
+            notification_sent = db.is_notification_sent(event_id, user_id)
+            logging.info(f"Проверка встречи {event['summary']} (ID: {event_id}): notification_sent = {notification_sent}")
+            
+            # Если встреча новая или о ней не было уведомления
+            if not db.is_event_known(event_id, user_id) or not notification_sent:
                 new_events_count += 1
-                
-                start_time = event['start'].get('dateTime', event['start'].get('date'))
-                end_time = event['end'].get('dateTime', event['end'].get('date'))
-                start_dt = safe_parse_datetime(start_time)
                 
                 meeting_info = (
                     f"📅 {hbold('Найдена новая онлайн-встреча:')}\n\n"
@@ -498,13 +395,42 @@ async def check_command(message: Message):
                 
                 await message.answer(meeting_info, parse_mode="HTML")
                 
-                # Сохраняем в базу данных как обработанное
+                # Сохраняем в базу данных как обработанное и помечаем уведомление как отправленное
                 db.add_known_event(
                     event_id=event_id,
                     summary=event['summary'],
                     start_time=start_time,
                     end_time=end_time,
-                    user_id=user_id
+                    user_id=user_id,
+                    notification_sent=True  # Важно: помечаем как отправленное
+                )
+                
+                # Проверяем, что флаг действительно установлен
+                if not db.is_notification_sent(event_id, user_id):
+                    logging.error(f"Ошибка: флаг notification_sent не был установлен для встречи {event_id}")
+                else:
+                    logging.info(f"Отправлено уведомление через /check пользователю {user_id} о встрече {event['summary']}")
+            else:
+                # Если встреча уже известна, проверяем изменения
+                known_event = next((e for e in known_events if e['event_id'] == event_id), None)
+                if known_event and (known_event['start_time'] != start_time or known_event['end_time'] != end_time):
+                    changed_events_count += 1
+                    change_info = (
+                        f"🔄 {hbold('Изменение в онлайн-встрече:')}\n\n"
+                        f"📌 {hbold(event['summary'])}\n"
+                        f"🕒 {start_dt.strftime('%d.%m.%Y %H:%M')}\n"
+                        f"🔗 {event['hangoutLink']}\n"
+                    )
+                    await message.answer(change_info, parse_mode="HTML")
+                
+                # Обновляем данные встречи
+                db.add_known_event(
+                    event_id=event_id,
+                    summary=event['summary'],
+                    start_time=start_time,
+                    end_time=end_time,
+                    user_id=user_id,
+                    notification_sent=True  # Обновляем флаг на всякий случай
                 )
         
         # Проверяем удаленные события
@@ -523,45 +449,12 @@ async def check_command(message: Message):
                 # Удаляем событие из базы
                 db.delete_known_event(known_event['event_id'], user_id)
         
-        if new_events_count == 0 and deleted_events_count == 0:
+        if new_events_count == 0 and deleted_events_count == 0 and changed_events_count == 0:
             await message.answer("Изменений в расписании онлайн-встреч не найдено.")
             
     except Exception as e:
         logging.error(f"Ошибка при проверке встреч: {e}")
         await message.answer(f"❌ Произошла ошибка: {str(e)}")
-
-# Команда /authstatus для проверки статуса авторизации
-@dp.message(Command("authstatus"))
-async def auth_status_command(message: Message):
-    user_id = message.from_user.id
-    token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
-    
-    if os.path.exists(token_file):
-        try:
-            with open(token_file, 'r') as f:
-                creds_data = json.load(f)
-                
-            # Проверяем наличие основных полей в токене
-            if 'token' in creds_data and 'refresh_token' in creds_data:
-                await message.answer(
-                    "✅ Вы успешно авторизованы в Google Calendar.\n"
-                    "Можете использовать команды /week и /check для работы с календарем."
-                )
-            else:
-                await message.answer(
-                    "⚠️ Ваш токен авторизации неполный. Рекомендуется повторить авторизацию.\n"
-                    "Используйте команду /auth для повторной авторизации."
-                )
-        except Exception as e:
-            await message.answer(
-                f"⚠️ Ошибка при проверке токена авторизации: {str(e)}\n"
-                "Рекомендуется повторить авторизацию с помощью команды /auth."
-            )
-    else:
-        await message.answer(
-            "❌ Вы не авторизованы в Google Calendar.\n"
-            "Используйте команду /auth для авторизации."
-        )
 
 # Команда /localauth для авторизации через локальный сервер
 @dp.message(Command("localauth"))
@@ -577,11 +470,6 @@ async def local_auth_command(message: Message):
         if creds:
             # Сохраняем токен в базу данных
             db.save_token(user_id, json.loads(creds.to_json()))
-            
-            # Сохраняем учетные данные
-            token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
-            with open(token_file, 'w') as token:
-                token.write(creds.to_json())
             
             await message.answer(
                 "✅ Авторизация успешно завершена!\n\n"
@@ -634,39 +522,7 @@ async def set_token_command(message: Message):
         # Проверяем наличие необходимых полей
         if 'token' not in token_data or 'refresh_token' not in token_data:
             await message.answer("❌ JSON-данные токена должны содержать поля 'token' и 'refresh_token'")
-            return
-        
-        # Сохраняем токен в файл
-        token_file = os.path.join(TOKEN_DIR, f'token_{user_id}.json')
-        with open(token_file, 'w') as f:
-            f.write(token_json)
-        
-        # Обновляем USER_ID
-        global USER_ID
-        USER_ID = str(user_id)
-        
-        # Сохраняем USER_ID в .env файл
-        env_path = '.env'
-        env_lines = []
-        
-        if os.path.exists(env_path):
-            with open(env_path, 'r') as f:
-                env_lines = f.readlines()
-        
-        # Обновляем или добавляем USER_ID
-        user_id_found = False
-        for i, line in enumerate(env_lines):
-            if line.startswith('USER_ID='):
-                env_lines[i] = f'USER_ID={user_id}\n'
-                user_id_found = True
-                break
-        
-        if not user_id_found:
-            env_lines.append(f'USER_ID={user_id}\n')
-        
-        # Записываем обновленный .env файл
-        with open(env_path, 'w') as f:
-            f.writelines(env_lines)
+            return        
         
         await message.answer("✅ Токен успешно сохранен! Теперь вы можете использовать команды /week и /check.")
     except json.JSONDecodeError:
@@ -744,90 +600,26 @@ async def notifications_settings(message: Message):
         parse_mode="HTML"
     )
 
-@dp.message(Command("settings"))
-async def notification_settings(message: Message):
-    """Позволяет пользователю настроить время и тип уведомлений"""
-    user_id = message.from_user.id
-    settings = db.get_user_settings(user_id)
-    
-    await message.answer(
-        "⚙️ Настройки уведомлений:\n\n"
-        f"1️⃣ Время предварительного уведомления: {settings['reminder_time']} минут\n"
-        "/set_reminder 5 - за 5 минут\n"
-        "/set_reminder 15 - за 15 минут\n"
-        "/set_reminder 30 - за 30 минут\n\n"
-        "2️⃣ Статус уведомлений:\n"
-        f"🆕 Новые встречи: {'✅' if settings['notify_new'] else '❌'}\n"
-        f"🚀 Начало встречи: {'✅' if settings['notify_start'] else '❌'}\n"
-        f"❌ Отмена встречи: {'✅' if settings['notify_cancel'] else '❌'}\n\n"
-        "Используйте команды для изменения настроек:\n"
-        "/toggle_new - новые встречи\n"
-        "/toggle_start - начало встречи\n"
-        "/toggle_cancel - отмена встречи"
-    )
-
-@dp.message(Command("set_reminder"))
-async def set_reminder_time(message: Message):
-    """Установка времени напоминания"""
+async def notify_before_meeting(meeting, user_id, minutes_before):
+    """Отправляет уведомление за указанное количество минут до начала встречи"""
+    event_id, summary, hangout_link, start_time = meeting
     try:
-        user_id = message.from_user.id
-        time = int(message.text.split()[1])
-        if time not in [5, 15, 30]:
-            await message.answer("❌ Доступные значения: 5, 15 или 30 минут")
-            return
+        start_dt = safe_parse_datetime(start_time)
+        now = datetime.now(timezone.utc)
+        reminder_time = start_dt - timedelta(minutes=minutes_before)
         
-        db.update_user_setting(user_id, 'reminder_time', time)
-        await message.answer(f"✅ Время напоминания установлено на {time} минут")
-    except (ValueError, IndexError):
-        await message.answer("❌ Используйте формат: /set_reminder <минуты>")
-
-@dp.message(Command("toggle_new"))
-async def toggle_new_notifications(message: Message):
-    """Включение/выключение уведомлений о новых встречах"""
-    user_id = message.from_user.id
-    settings = db.get_user_settings(user_id)
-    new_value = not settings['notify_new']
-    db.update_user_setting(user_id, 'notify_new', new_value)
-    status = "включены ✅" if new_value else "выключены ❌"
-    await message.answer(f"Уведомления о новых встречах {status}")
-
-@dp.message(Command("toggle_start"))
-async def toggle_start_notifications(message: Message):
-    """Включение/выключение уведомлений о начале встреч"""
-    user_id = message.from_user.id
-    settings = db.get_user_settings(user_id)
-    new_value = not settings['notify_start']
-    db.update_user_setting(user_id, 'notify_start', new_value)
-    status = "включены ✅" if new_value else "выключены ❌"
-    await message.answer(f"Уведомления о начале встреч {status}")
-
-@dp.message(Command("toggle_cancel"))
-async def toggle_cancel_notifications(message: Message):
-    """Включение/выключение уведомлений об отмене встреч"""
-    user_id = message.from_user.id
-    settings = db.get_user_settings(user_id)
-    new_value = not settings['notify_cancel']
-    db.update_user_setting(user_id, 'notify_cancel', new_value)
-    status = "включены ✅" if new_value else "выключены ❌"
-    await message.answer(f"Уведомления об отмене встреч {status}")
-
-@dp.message(Command("stats"))
-async def meeting_stats(message: Message):
-    """Показывает статистику встреч"""
-    user_id = message.from_user.id
-    try:
-        stats = db.get_user_stats(user_id)
-        await message.answer(
-            "📊 Статистика встреч:\n\n"
-            f"Всего встреч: {stats['total']}\n"
-            f"Проведено: {stats['completed']}\n"
-            f"Отменено: {stats['cancelled']}\n"
-            f"Предстоит: {stats['upcoming']}\n"
-            f"Общая длительность: {stats['total_duration']} часов"
-        )
+        # Проверяем, нужно ли отправлять уведомление
+        if now >= reminder_time and not db.is_event_started(event_id, user_id, minutes_before):
+            await bot.send_message(
+                user_id,
+                f"⏰ Напоминание: встреча {summary} начнется через {minutes_before} минут.\n🔗 {hangout_link}",
+                parse_mode="HTML"
+            )
+            # Помечаем уведомление как отправленное
+            db.add_started_event(event_id, summary, start_time, None, user_id, minutes_before)
+            logging.info(f"Отправлено напоминание пользователю {user_id} о встрече {summary} за {minutes_before} минут")
     except Exception as e:
-        logging.error(f"Ошибка при получении статистики: {e}")
-        await message.answer(f"❌ Ошибка при получении статистики: {str(e)}")
+        logging.error(f"Ошибка при отправке напоминания пользователю {user_id}: {e}")
 
 # Запуск бота
 async def main():
